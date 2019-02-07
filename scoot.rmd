@@ -1,0 +1,286 @@
+---
+title: "How to Increase Sales of Ride Credit"
+output:
+  html_document:
+    keep_md: yes
+    toc: yes
+  html_notebook:
+    toc: yes
+---
+
+In this analysis, we set out to predict when a visitor to our Scootfinity homepage makes a **ride credit purchase**. The five predictor variables available to us are the user's *geographic country*, *age*, *registration status*, *marketing channel*, and *page views*.
+
+```{r eval=FALSE, include=FALSE}
+setwd('~/local/conv')
+```
+
+## Data Preparation
+```{r echo=TRUE}
+set.seed(1)         # ensure repeatable results
+library('dplyr')    # splicing/formatting
+library('ggplot2')  # graphing
+library('caret')    # ml functions
+library('e1071')
+library('randomForest')
+df = read.csv('conversion_data.csv')
+```
+We start out by looking for any potential issues in the data. This can be things like low volume, poor coverage, or missing data. We might also learn some things about the data that will help us build our model.
+```{r}
+dim(df)
+head(df)
+summary(df)
+sapply(df, class)
+
+# get an idea of the target distribution
+cbind(n = table(df$converted), pct = prop.table(table(df$converted)))
+
+# check for missing data
+df %>%
+  summarise_all(funs(sum(is.na(.))))
+```
+
+
+*[JL Note] age in this scenario is self-reported at sign-up, so shouldn't it be NA where new_user = 0? In this data, it's populated for every row. See: head(df[df$new_user == 0, ])*
+
+From above, we see that we have a hefty dataset of 316,200 rows with no missing data. Although four of the six columns are numeric, only two of them are continuous variables (the other two, *new_user* and *converted*, are boolean categorical).
+
+Let's properly format the boolean categorical variables as factors (mostly for cleanliness, but also to ensure our problem is computed as a classification and not a regression).
+
+```{r}
+df$new_user = as.factor(df$new_user)
+df$converted = as.factor(df$converted)
+```
+
+Now look closer at our two continuous variables, *age* and *total_pages_visited*.
+
+```{r}
+boxplot(df$age, main = 'age')
+boxplot(df$total_pages_visited, main = 'total pages visited')
+```
+
+We notice here that age contains some impossible values (111 and 123), so let's clean those out. This could be avoided in the future by gating the acceptable age values in the sign-up form.
+
+```{r age filter, echo=TRUE}
+df = 
+  df %>% 
+  filter(df$age < 100)
+```
+
+Let's pause and mention some improvements that can be made to the data. I would ask the Scootfinity team to:
+
+1. Add RFM metrics (recency, frequency, and monetary value)
+
+2. Perform identity resolution on *country* so that it doesn't change every time a user travels, connects through a VPN or corp net
+
+3. Add categories to the target variable corresponding to the item purchased (as opposed to the binary "user purchased" or "user did not purchase")
+
+Next, let's check to see if any of our continuous features are redundant. Any correlation higher than 0.5 would be worrysome, but we don't see any issues here.
+
+```{r correlation check}
+cor(dplyr::select_if(df, is.numeric))
+```
+
+Finally, let's get a visual representation of the problem. This would be much more useful with more than two continuous variables, but is still good practice to review.
+
+```{r}
+# stratified sample of a managable size for graphing
+plot_index = createDataPartition(df$converted, p = 0.1, list = FALSE)
+df_5pct = df[plot_index, ]
+x = df_5pct[, c('country', 'age', 'new_user', 'source', 'total_pages_visited')]
+y = df_5pct[, 'converted']
+
+featurePlot(x = dplyr::select_if(x, is.numeric), y = y, plot = 'ellipse')
+featurePlot(x = dplyr::select_if(x, is.numeric), y = y, plot = 'density')
+```
+
+We observe some interesting separation in both features, which is promising. Let's move on the modeling.
+
+## Modeling
+
+We use stratified sampling on the target column (*converted*) to partition data 80% to training and 20% to validation.
+
+```{r}
+train_index = createDataPartition(df$converted, p = 0.8, list = FALSE)
+df_valid = df[-train_index, ]  # 20% of data for validation
+df_train = df[train_index, ]   # 80% for training
+```
+
+Given the short time window for this analysis (our web devs want to iterate quickly!), let's compare two algorithms: Linear Discriminant Analysis (LDA) and Random Forest (RF).
+
+```{r lda model}
+# Set up parameters to use cross validation and accuracy
+control = trainControl(method = "cv", number = 5)
+metric = "Accuracy"
+
+# linear discriminant analysis
+start_time = Sys.time()
+mod_lda = train(converted ~ ., data = df_train, method = "lda", metric = metric, trControl = control)
+end_time = Sys.time()
+end_time - start_time
+```
+
+Let's get an idea of the most important predictors in our data.
+
+```{r}
+importance = varImp(mod_lda, scale=FALSE)
+plot(importance)
+```
+
+We see that total visits are far and away the most important indicator for purchase intent.
+
+```{r random forest}
+# random forest
+start_time = Sys.time()
+mod_rf = train(converted ~ ., data = df_train, method = "rf", metric = metric, trControl = control)
+end_time = Sys.time()
+end_time - start_time
+
+# summarize both results
+results = resamples(list(lda = mod_lda, rf = mod_rf))
+dotplot(results)
+```
+
+Both models show high accuracy and mediocre kappa, which is not terribly unexpected, since we already observed a low conversion rate of 3% above. What I mean by this is that since 97% of visitors don't make a purchase, it's difficult to move the needle even higher (the difference between 98% of non-buyers and 97% of non-buyers "looks bad"" by these measures).
+
+We will need to dig deeper to better understand which model was "better." Given that LDA required seconds to complete while RF required hours, if we find that the two models perform nearly identical, we would almost always pick the easier (i.e., cheaper) one. Granted, RF typically has more room to improve with optimization than LDA.
+
+```{r}
+print(mod_rf)
+```
+
+The best RF model used mtry = 5, which would be useful information in a full optimization exercise.
+
+Now let's dig into the confusion matrices to get more detail on the skill of our models.
+
+```{r}
+# LDA
+pred <- predict(mod_lda, df_valid)
+confusionMatrix(pred, df_valid$converted, positive = '1')
+# random forest
+pred <- predict(mod_rf, df_valid)
+confusionMatrix(pred, df_valid$converted, positive = '1')
+```
+
+Since we are most interested in making sales and finding new buyers, we like LDA better here since it was better at finding buyers. In other words, although random forests yielded slightly higher accuracy, LDA showed better sensitivity (77% vs. 67%). In addition, higher sensitivity leads to less true negatives (i.e., people that we think are not buyers but actually are). This mitigates potential revenue loss in offering discounts to people who were going to buy anyway.
+
+## Iterations
+
+My recommendation for next steps would be to fine tune and experiment with the goal of maximizing sensitivity (correctly identifying a buyer). RF tuning options include feature engineering, tunegrid, tuneRF, random searches, etc.
+
+I was curious to see how reducing level complexity in *age* and *total_pages_visited* would affect the model in terms of speed and sensitivity. Let's do that now.
+
+```{r}
+# bucket age and visit into roughly evenly sized buckets
+age_bucket = cut(df$age, 
+                 c(16, 21, 24, 29, 34, 39, max(df$age)), 
+                 labels=c('17-21', '22-24', '25-29', '30-34', '35-39', '40+'))
+cbind(n = table(age_bucket), pct = prop.table(table(age_bucket)))
+
+visit_bucket = cut(df$total_pages_visited, 
+                   c(0, 1, 2, 3, 4, 5, 6, 8, max(df$total_pages_visited)), 
+                   labels=c('1', '2', '3', '4', '5', '6', '7-8', '9+'))
+cbind(n = table(visit_bucket), pct = prop.table(table(visit_bucket)))
+
+# Build bucketed dataset
+df_b = cbind(df[, c('country', 'new_user', 'source', 'converted')], age_bucket, visit_bucket)
+
+# split bucketed training and validation sets
+df_valid_b = df_b[-train_index, ]  # 20% of data for validation
+df_train_b = df_b[train_index, ]   # 80% for training
+```
+
+Here we run the bucketed LDA and compare it to before.
+
+```{r bucketed lda}
+# bucketed LDA
+start_time = Sys.time()
+mod_lda_b = train(converted ~ ., data = df_train_b, method="lda", metric = metric, trControl = control)
+end_time = Sys.time()
+end_time - start_time
+
+pred <- predict(mod_lda_b, df_valid_b)
+confusionMatrix(pred, df_valid_b$converted, positive = '1')
+
+# compare to unbucketed LDA
+pred <- predict(mod_lda, df_valid)
+confusionMatrix(pred, df_valid$converted, positive = '1')
+```
+
+Sensitivity improved to 89%, but everything else got much worse-- even the training time was slower (12 seconds vs. 9.5 seconds). Let's look at the importance of each parameter to figure out why.
+
+```{r}
+importance <- varImp(mod_lda_b, scale=FALSE)
+plot(importance)
+```
+
+The importance of *total_pages_visited* went down, while *age* stayed the same, so bucketing only hurt the predictability of *total_pages_visited*.
+
+I went ahead and tried the same idea, but only bucketed *age* and left *total_pages_visited* as is. Training time went up slightly from 8.5 seconds to 9.5 seconds, but the model very slightly improved in sensitivity, accuracy, and kappa. Code and results are available in Appendix A.
+
+(I did not do this same bucketing experiment with random forest due to time constraints, but would compare its performance with the *age* bucketed.)
+
+## Recommendations
+
+I recommend that we design an outreach marketing campaign to retarget users that have a high propensity to make a purchase that haven't done so already. To further incentivize users, we could offer a discount code, but this of course will require further cost/benefit analysis. We will need to determine what level of discount is appropriate for each user. Ideally, we only provide discounts to users that are on the fence, since providing them to users who would have made a purchase anyway is lost revenue.
+
+Operationally, we'll need to work out an automated workflow to have the model update regularly and connect natively to our ads platform (Google, Facebook, etc.).
+
+Since it's become clear that *total_pages_visited* is a great predictor of interest, let's consider adding live support chat functionality to the webpage.
+
+
+**For ClearBrain:**
+
+To make ClearBrain's tagline, to "allow you to predict any user event without having to write a line of code," truly come to life, Scootfinity would need a self-service destination where they could easily upload any snippet of data and build a model in a matter of clicks. They should be able to connect those results to a broad selection of downstream "execution platforms" with simple login authentication.
+
+The self-service platform should prompt the user with context clues about how to build a good model. If they are uploading web traffic data, it's not far fetched for CB to have a knowledge base built up to inform the user which of their columns are likely to be important, or what data they are missing in their sample that they should consider adding.
+
+
+**Extra Ad Testing Question**
+
+**The Scenario:**
+Your company has created two different ads, ad #1 and #2, and wants to test which ad results in the most conversions. Suppose you randomly split your customers into two groups, X and Y. Customers in group X are shown ad #1, and customers in group Y are shown ad #2. After a month of running the ads, you analyze the results and discover that customers in group X converted at a 3.5% rate with 99% significance, while customers in group Y converted at a 2% rate with 99% significance. Can we conclude from these results that ad #1 outperforms ad #2 with statistical significance? Why or why not?
+
+**Answer:**
+This is impossible to answer without knowing the corresponding sample sizes and variance. If we had that information, we would be able to calculate confidence intervals around the sample means through an independent two sample t-test and make a determination. (If those confidence intervals did not cross, then we would be able to conclude that ad #1 outperformed ad #2 with statistical significance.)
+
+## Appendix
+
+#### Section A
+Testing bucketed age without bucketing page visits. Very slightly better than vanilla LDA.
+
+```{r}
+# Build bucketed dataset
+df_b2 = cbind(df[, c('country', 'new_user', 'source', 'total_pages_visited', 'converted')], age_bucket)
+
+# split bucketed training and validation sets
+df_valid_b2 = df_b2[-train_index, ]  # 20% of data for validation
+df_train_b2 = df_b2[train_index, ]   # 80% for training
+
+print("bucketed LDA")
+start_time = Sys.time()
+mod_lda_b2 = train(converted ~ ., data = df_train_b2, method="lda", metric = metric, trControl = control)
+end_time = Sys.time()
+end_time - start_time
+
+pred <- predict(mod_lda_b2, df_valid_b2)
+confusionMatrix(pred, df_valid_b2$converted, positive = '1')
+
+print("unbucketed LDA")
+pred <- predict(mod_lda, df_valid)
+confusionMatrix(pred, df_valid$converted, positive = '1')
+```
+
+#### Section B
+
+Propensity scores on linear model.
+
+```{r}
+prop = cbind(df_valid, purchase = predict(mod_lda, df_valid, type = 'prob'))
+
+plot_index_2 = sample(1:nrow(prop), 20000)
+prop_20k = prop[plot_index_2, ]
+x = prop_20k[, c('country', 'age', 'new_user', 'source', 'total_pages_visited', 'purchase.1')]
+y = prop_20k[, 'converted']
+
+featurePlot(x = dplyr::select_if(x, is.numeric), y = y, plot = 'ellipse')
+```
